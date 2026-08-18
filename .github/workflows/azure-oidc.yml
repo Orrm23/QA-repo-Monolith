@@ -1,0 +1,44 @@
+name: Azure OIDC Federated Credentials
+
+on:
+  push:
+    branches:
+      - feature/dev
+  pull_request:
+    branches:
+      - feature/dev
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  azure-login:
+    name: Azure Login with Federated Credentials
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify Azure authentication
+        shell: bash
+        run: |
+          az account show --output table
+          az account get-access-token --query expiresOn --output tsv
+
+      # Example: run Azure/Terraform/DevSecOps commands after OIDC login.
+      # - name: Terraform Init
+      #   run: terraform -chdir=infra init
+      #
+      # - name: Terraform Plan
+      #   run: terraform -chdir=infra plan
