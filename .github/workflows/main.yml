@@ -1,42 +1,186 @@
-name: Azure OIDC - Self Hosted
+name: Standard DevSecOps Pipeline
 
 on:
   push:
     branches:
       - feature/dev
+      - main
 
   pull_request:
     branches:
       - feature/dev
+      - main
 
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
+  security-events: write
+
+env:
+  TF_VERSION: "1.14.6"
+  TF_WORKING_DIR: "./infra"
+
+# ============================================================
+# SECURITY
+# ============================================================
 
 jobs:
 
-  azure-login:
+  sast:
+    name: SAST - SonarQube
+    runs-on: [self-hosted, Windows]
 
-    name: Azure Login using Federated Credentials
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+
+  secret-scan:
+    name: Secret Scan - Gitleaks
+    runs-on: [self-hosted, Windows]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  dependency-scan:
+    name: Dependency Scan - Trivy
+    runs-on: [self-hosted, Windows]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+
+
+  iac-security:
+    name: IaC Security - Checkov
+    runs-on: [self-hosted, Windows]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ env.TF_WORKING_DIR }}
+          framework: terraform
+          soft_fail: false
+
+
+  terraform-lint:
+    name: Terraform Lint - TFLint
+    runs-on: [self-hosted, Windows]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        shell: powershell
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          tflint --init
+          tflint --format compact
+
+
+# ============================================================
+# TERRAFORM VALIDATION
+# ============================================================
+
+  terraform-validate:
+
+    name: Terraform Validate
+
+    needs:
+      - sast
+      - secret-scan
+      - dependency-scan
+      - iac-security
+      - terraform-lint
 
     runs-on: [self-hosted, Windows]
 
     steps:
 
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Azure Login using OIDC
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        shell: powershell
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -backend=false
+
+      - name: Terraform Validate
+        shell: powershell
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform validate
+
+
+# ============================================================
+# AZURE OIDC
+# ============================================================
+
+  azure-auth:
+
+    name: Azure OIDC Authentication
+
+    needs: terraform-validate
+
+    runs-on: [self-hosted, Windows]
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login - OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Verify Azure Login
-        shell: pwsh
+      - name: Verify Azure
+        shell: powershell
         run: |
           Write-Host "Checking Azure authentication..."
 
@@ -44,9 +188,112 @@ jobs:
 
           Write-Host "Azure authentication successful."
 
-      - name: Verify Subscription
-        shell: pwsh
+
+# ============================================================
+# TERRAFORM PLAN
+# ============================================================
+
+  terraform-plan:
+
+    name: Terraform Plan
+
+    needs: azure-auth
+
+    runs-on: [self-hosted, Windows]
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login - OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        shell: powershell
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
-          az account show `
-            --query "{Subscription:id, Tenant:tenantId, User:user.name}" `
-            --output table
+          terraform init
+
+      - name: Terraform Plan
+        shell: powershell
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -out=tfplan
+
+      - name: Export Terraform Plan
+        shell: powershell
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform show -no-color tfplan > tfplan.txt
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            ${{ env.TF_WORKING_DIR }}/tfplan
+            ${{ env.TF_WORKING_DIR }}/tfplan.txt
+
+
+# ============================================================
+# MANUAL APPROVAL + APPLY
+# ============================================================
+
+  terraform-apply:
+
+    name: Manual Approval + Terraform Apply
+
+    needs: terraform-plan
+
+    runs-on: [self-hosted, Windows]
+
+    environment:
+      name: production
+
+    # Apply only from main
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download Approved Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Azure Login - OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        shell: powershell
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init
+
+      - name: Terraform Apply Approved Plan
+        shell: powershell
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply -auto-approve tfplan
